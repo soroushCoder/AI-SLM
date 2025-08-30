@@ -1,0 +1,8 @@
+# rebuild API with new deps
+docker compose -f deploy/docker-compose.dev.yml build --no-cache api
+
+# start/refresh everything
+docker compose -f deploy/docker-compose.dev.yml up -d
+
+# (if you didn't already) pull the SLM
+docker compose -f deploy/docker-compose.dev.yml exec ollama ollama pull phi3:mini
