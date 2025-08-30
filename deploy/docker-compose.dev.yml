@@ -1,0 +1,21 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: slm-ollama
+    ports: ["11434:11434"]
+    volumes:
+      - ollama:/root/.ollama
+
+  api:
+    build:  
+      context: ../api          
+      dockerfile: Dockerfile
+    environment:
+      OPENAI_BASE_URL: http://ollama:11434/v1
+      OPENAI_API_KEY: dummy
+      LLM_MODEL: phi3:mini
+    depends_on: [ollama]
+    ports: ["8000:8000"]
+
+volumes:
+  ollama:
