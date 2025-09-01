@@ -3,5 +3,6 @@ uvicorn[standard]
 openai
 pymilvus
 langchain-community
+langchain-milvus
 sentence-transformers
 pypdf

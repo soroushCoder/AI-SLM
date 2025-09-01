@@ -3,6 +3,7 @@ from typing import List
 from langchain_community.vectorstores import Milvus as LC_Milvus
 from langchain.docstore.document import Document
 
+from langchain_milvus import Milvus as MilvusVectorStore
 EMBEDDINGS_KIND = os.getenv("EMBEDDINGS_KIND", "local").lower()
 
 def _get_embedding_fn():

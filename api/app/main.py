@@ -25,6 +25,7 @@ app.include_router(ingest_router)
 
 @app.post("/chat")
 def chat(body: dict = Body(...)):
+    print("LLM MODEL:", MODEL)
     messages = body.get("messages", [{"role": "user", "content": "Hi"}])
     # Take last user message for retrieval
     user_q = ""
@@ -34,7 +35,7 @@ def chat(body: dict = Body(...)):
             break
 
     # Retrieve context
-    docs = retrieve(user_q, k=4)
+    docs = retrieve(user_q, k=2)
     ctx = "\n\n".join([f"[DOC {i+1}] {d.metadata.get('source','')}\n{d.page_content}" for i, d in enumerate(docs)])
 
     system = (
