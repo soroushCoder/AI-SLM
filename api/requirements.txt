@@ -8,3 +8,4 @@ sentence-transformers
 pypdf
 sse-starlette
 celery[redis]
+redis

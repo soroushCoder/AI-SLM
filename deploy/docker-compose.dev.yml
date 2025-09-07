@@ -71,10 +71,12 @@ services:
       MILVUS_HOST: milvus
       MILVUS_PORT: 19530
       MILVUS_COLLECTION: company_kb
-      EMBEDDINGS_KIND: openai         # (faster) or local
+      EMBEDDINGS_KIND: openai         
       OPENAI_EMBED_MODEL: text-embedding-3-small
       REDIS_URL: redis://redis:6379/0
       PYTHONUNBUFFERED: "1"
+      API_KEYS: devkey                
+      RATE_LIMIT_PER_MIN: 60
     depends_on: [redis, milvus]     
 
       

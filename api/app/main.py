@@ -1,10 +1,12 @@
 import os
-from fastapi import FastAPI, Body
+from fastapi import FastAPI, Body,Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from openai import OpenAI
 from .ingest import router as ingest_router
 from .vectorstore import retrieve
+from .auth import require_api_key, rate_limit
 
 
 app = FastAPI(title="SLM Chat API")
@@ -18,6 +20,8 @@ client = OpenAI(
     base_url=os.getenv("OPENAI_BASE_URL", "http://localhost:11434/v1"),
 )
 MODEL = os.getenv("LLM_MODEL", "phi3:mini")
+
+app.include_router(ingest_router, dependencies=[Depends(require_api_key), Depends(rate_limit)])
 
 @app.get("/health")
 def health():
@@ -37,7 +41,7 @@ def chat(body: dict = Body(...)):
             break
 
     # Retrieve context
-    docs = retrieve(user_q, k=2)
+    docs = retrieve(user_q, k=4)
     ctx = "\n\n".join([f"[DOC {i+1}] {d.metadata.get('source','')}\n{d.page_content}" for i, d in enumerate(docs)])
 
     system = (
@@ -66,8 +70,8 @@ def chat_stream(body: dict = Body(...)):
 
     # --- build augmented messages exactly like /chat ---
     user_q = next((m.get("content","") for m in reversed(messages) if m.get("role")=="user"), "")
-    # calls your vector store to get the 2 most relevant chunks.
-    docs = retrieve(user_q, k=2)
+    # calls your vector store to get the 4 most relevant chunks.
+    docs = retrieve(user_q, k=4)
     ctx = "\n\n".join([f"[DOC {i+1}] {d.metadata.get('source','')}\n{d.page_content}" for i, d in enumerate(docs)])
     system = (
         "You are a concise customer service agent. "
