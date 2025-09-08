@@ -49,7 +49,7 @@ services:
       # RAG settings
       MILVUS_HOST: milvus
       MILVUS_PORT: 19530
-      MILVUS_COLLECTION: company_kb_v2
+      MILVUS_COLLECTION: company_kb
       EMBEDDINGS_KIND: local           # local | openai
       EMBEDDINGS_MODEL: sentence-transformers/all-MiniLM-L6-v2  # used if local
       OPENAI_EMBED_MODEL: text-embedding-3-small # used if openai
@@ -61,7 +61,7 @@ services:
 
   worker:
     build:
-      context: ./api
+      context: ../api
       dockerfile: Dockerfile
     command: ["celery", "-A", "app.celery_app.celery", "worker", "--loglevel=INFO", "-Q", "ingest"]
     environment:
@@ -71,12 +71,14 @@ services:
       MILVUS_HOST: milvus
       MILVUS_PORT: 19530
       MILVUS_COLLECTION: company_kb
-      EMBEDDINGS_KIND: openai         
+      EMBEDDINGS_KIND: local         
       OPENAI_EMBED_MODEL: text-embedding-3-small
       REDIS_URL: redis://redis:6379/0
       PYTHONUNBUFFERED: "1"
       API_KEYS: devkey                
       RATE_LIMIT_PER_MIN: 60
+    volumes:
+      - ../data:/data  
     depends_on: [redis, milvus]     
 
       

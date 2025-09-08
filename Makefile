@@ -77,9 +77,11 @@ logs-worker:
 	$(COMPOSE) logs -f worker
 # | jq pipes the output of the previous command into jq, a command-line JSON processor. You use it to pretty-print JSON, pick fields, transform, or filter results.
 ingest-q:
-	@curl -s -X POST http://localhost:8000/ingest | jq .
+	curl -s -X POST http://localhost:8000/ingest \
+	  -H 'X-API-Key: $(KEY)' | jq .
 
 ingest-status:
 	@test -n "$(ID)" || (echo "Usage: make ingest-status ID=<task_id>" && exit 1)
-	@curl -s http://localhost:8000/ingest/status/$(ID) | jq .
+	@curl -s http://localhost:8000/ingest/status/$(ID) -H 'X-API-Key: $(KEY)'| jq .
+
 

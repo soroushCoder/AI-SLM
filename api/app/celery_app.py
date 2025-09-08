@@ -34,15 +34,30 @@
 
 import os
 from celery import Celery
-# Broker (where jobs are queued), and
-broker = os.getenv("REDIS_URL", "redis://redis:6379/0")
-# Backend (where results are stored)
 
+broker = os.getenv("REDIS_URL", "redis://redis:6379/0")
 backend = os.getenv("REDIS_URL", "redis://redis:6379/0")
-#Celery = Python task queue for background jobs (workers, retries, schedules).
-celery = Celery("slm-chatbot", broker=broker, backend=backend)
+
+# include ensures the worker imports app.ingest (runs the @celery.task decorator)
+celery = Celery(
+    "slm-chatbot",
+    broker=broker,
+    backend=backend,
+    include=["app.ingest"],           # <-- add this
+)
+
 celery.conf.update(
     task_acks_late=True,
-    task_routes={"app.tasks.ingest_dir_task": {"queue": "ingest"}},
     worker_prefetch_multiplier=1,
+    task_track_started=True,
+    task_routes={
+        "app.tasks.ingest_dir_task": {"queue": "ingest"}  # keep your custom task name
+    },
 )
+
+# (optional, extra safety)
+try:
+    import app.ingest  # noqa: F401  # force import to register tasks
+except Exception as e:
+    print(f"[celery] failed to import app.ingest: {e}", flush=True)
+

@@ -7,6 +7,8 @@ from openai import OpenAI
 from .ingest import router as ingest_router
 from .vectorstore import retrieve
 from .auth import require_api_key, rate_limit
+from .coffee import router as coffee_router
+from .coach import router as coach_router
 
 
 app = FastAPI(title="SLM Chat API")
@@ -22,12 +24,14 @@ client = OpenAI(
 MODEL = os.getenv("LLM_MODEL", "phi3:mini")
 
 app.include_router(ingest_router, dependencies=[Depends(require_api_key), Depends(rate_limit)])
+app.include_router(coffee_router)
+app.include_router(coach_router)
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-app.include_router(ingest_router)
+
 
 @app.post("/chat")
 def chat(body: dict = Body(...)):
