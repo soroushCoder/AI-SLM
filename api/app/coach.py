@@ -1,10 +1,9 @@
 # api/app/coach.py
-import os, json
+import os, json, re
 from typing import Optional, Literal, List, Dict
 from fastapi import APIRouter, Body
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from openai import OpenAI
 
 from .vectorstore import retrieve
 from .coffee import (
@@ -15,7 +14,7 @@ from .coffee import (
 
 router = APIRouter(prefix="/coach", tags=["coffee-coach"])
 
-# -------- slot schema (what we track) --------
+# -------- slot schema --------
 Beverage = Literal["espresso","americano","cappuccino","latte","pourover","aeropress","french_press","moka"]
 Machine  = Literal["espresso_pump","espresso_lever","pod","moka","pourover_kettle","aeropress","french_press"]
 Roast    = Literal["light","medium","dark"]
@@ -31,17 +30,9 @@ class CoffeeSlots(BaseModel):
     grind_setting: Optional[float] = None
     extraction_time_s: Optional[float] = None
 
-# -------- OpenAI-compatible client (Ollama behind OpenAI API) --------
-def _client() -> OpenAI:
-    return OpenAI(
-        api_key=os.getenv("OPENAI_API_KEY", "dummy"),
-        base_url=os.getenv("OPENAI_BASE_URL", "http://localhost:11434/v1"),
-    )
-
-MODEL = os.getenv("LLM_MODEL", "phi3:mini")
-
-# -------- helpers: rules, needed slots, retrieval context --------
+# -------- rules & helpers --------
 def _recommend_from_slots(s: CoffeeSlots):
+    """Compute rule-based targets from slots (no LLM)."""
     bev = (s.beverage or "espresso")
     mach = s.machine or (
         "espresso_pump"   if bev in ("espresso","latte","cappuccino","americano") else
@@ -66,208 +57,188 @@ def _recommend_from_slots(s: CoffeeSlots):
     base.notes.append("This drink uses an espresso base—adjust milk/water to taste.")
     return base
 
-def _needed_slots(s: CoffeeSlots) -> List[str]:
-    need: List[str] = []
-    if not s.beverage:
-        need.append("beverage (espresso / pourover / aeropress / french_press / moka)")
-    if not s.machine:
-        if s.beverage in ("pourover","french_press","aeropress","moka"):
-            need.append("machine (pourover_kettle / french_press / aeropress / moka)")
+def _dedupe_sources(docs) -> List[str]:
+    """Keep unique filenames from retrieved docs for citation."""
+    seen, out = set(), []
+    for d in docs:
+        src = os.path.basename(d.metadata.get("source",""))
+        if src and src not in seen:
+            seen.add(src); out.append(src)
+    return out
+
+def _advice(slots: CoffeeSlots, rec, docs) -> List[str]:
+    """
+    Concrete tweaks based on user inputs vs. typical ranges + retrieved docs.
+    Always returns a list of short bullet suggestions.
+    """
+    tips: List[str] = []
+    roast = (slots.roast or "medium").lower()
+    bev   = (slots.beverage or rec.beverage or "espresso").lower()
+
+    # Roast-based typical brew temperature ranges (°C)
+    roast_temp = {
+        "light":  (94, 96),
+        "medium": (92, 94),
+        "dark":   (90, 92),
+    }
+    lo, hi = roast_temp.get(roast, (92, 94))
+
+    # Temperature advice
+    if slots.water_temp_c is not None:
+        t = float(slots.water_temp_c)
+        if t < lo:
+            tips.append(f"Temperature {t:.0f}°C is low for {roast}; try ~{lo}–{hi}°C next time.")
+        elif t > hi:
+            tips.append(f"Temperature {t:.0f}°C is high for {roast}; try ~{lo}–{hi}°C next time.")
         else:
-            need.append("machine (espresso_pump / espresso_lever / pod)")
-    if not s.roast:
-        need.append("roast (light / medium / dark)")
-    # precision fields by beverage
-    if s.beverage == "espresso":
-        if s.dose_g is None:        need.append("dose (g)")
-        if s.water_temp_c is None:  need.append("brew temperature (°C)")
-        if s.pressure_bar is None:  need.append("pump pressure (bar)")
-    elif s.beverage == "pourover":
-        if s.dose_g is None:        need.append("dose (g)")
-        if s.water_temp_c is None:  need.append("water temperature (°C)")
+            tips.append(f"Temperature {t:.0f}°C looks good for {roast}.")
     else:
-        if s.dose_g is None:        need.append("dose (g)")
-        if s.water_temp_c is None:  need.append("water temperature (°C)")
-    return need
+        tips.append(f"For {roast} roasts, aim around {lo}–{hi}°C.")
 
-def _slots_query(s: CoffeeSlots) -> str:
-    parts: List[str] = []
-    if s.beverage: parts.append(s.beverage)
-    if s.roast:    parts.append(f"{s.roast} roast")
-    if s.machine and "espresso" in s.machine:
-        parts.append("espresso brew pressure temperature ratio")
-    elif s.beverage == "pourover":
-        parts.append("pourover ratio temperature bloom time")
-    elif s.beverage in ("aeropress","french_press","moka"):
-        parts.append("recipe ratio temperature time")
-    return " ".join(parts) or "espresso recipe ratio temperature pressure"
+    # Beverage-specific guidance
+    if bev == "espresso":
+        # Pressure advice
+        if slots.pressure_bar is not None:
+            p = float(slots.pressure_bar)
+            if p < 8:
+                tips.append(f"~{p:.1f} bar is on the low side—grind a bit finer or extend shot to hit your ratio.")
+            elif p > 10:
+                tips.append(f"~{p:.1f} bar is high—consider a touch coarser to avoid bitterness.")
+            else:
+                tips.append(f"~{p:.1f} bar is in the classic range.")
+        else:
+            tips.append("Aim for ~9 bar at the puck for classic pump espresso.")
 
-def _ctx(docs, max_chars=1200) -> str:
-    """Compact context to keep tokenization fast."""
-    out, n = [], 0
-    for i, d in enumerate(docs, 1):
-        chunk = f"[DOC {i}] {d.metadata.get('source','')}\n{d.page_content}\n\n"
-        if n + len(chunk) > max_chars:
-            break
-        out.append(chunk); n += len(chunk)
-    return "".join(out)
+        # Ratio/yield suggestion if dose known
+        if slots.dose_g:
+            try:
+                # prefer explicit brew_ratio from rules
+                r = rec.targets.get("brew_ratio") or "1:2"
+                # try to parse numeric factor from "1:2.2" etc. for calc range
+                m = re.search(r"^1:(\d+(\.\d+)?)$", str(r))
+                mult = float(m.group(1)) if m else 2.0
+                dose = float(slots.dose_g)
+                low = round(dose * mult, 0)
+                high = round(dose * (mult + 0.5), 0)
+                tips.append(f"With {dose:.0f} g in, target ~{r} (≈ {int(low)}–{int(high)} g out).")
+            except Exception:
+                pass
 
-def _format_recipe(rec, sources: List[str]) -> str:
-    """Deterministic recipe text from the rule engine (no LLM)."""
-    lines: List[str] = []
-    lines.append(f"Dial-in {rec.beverage} — practical recipe")
-    lines.append("")
-    if rec.targets:
-        lines.append("Targets")
-        for k, v in rec.targets.items():
-            lines.append(f"- {k}: {v}")
-    if getattr(rec, "adjustments", None):
-        lines.append("")
-        lines.append("Adjust if needed")
-        for adj in rec.adjustments:
-            lines.append(f"- {adj}")
-    if getattr(rec, "steps", None):
-        lines.append("")
-        lines.append("Steps")
-        for i, step in enumerate(rec.steps, 1):
-            lines.append(f"{i}. {step.title}: {step.detail}")
-    if getattr(rec, "notes", None):
-        lines.append("")
-        lines.append("Notes")
-        for n in rec.notes:
-            lines.append(f"- {n}")
-    if sources:
-        lines.append("")
-        lines.append(f"(Sources: {', '.join(sources)})")
-    return "\n".join(lines)
+    # Retrieved sources for traceability
+    srcs = _dedupe_sources(docs)
+    if srcs:
+        tips.append(f"(Sources: {', '.join(srcs[:3])})")
+    return tips
+
+def _format_advice_only(advice: List[str]) -> str:
+    """Render only the advice bullets as text."""
+    if not advice:
+        return "Everything looks good based on your inputs."
+    return "\n".join(f"- {t}" for t in advice if t.strip())
 
 # -------- request model --------
 class CoachTurnRequest(BaseModel):
     messages: List[Dict[str,str]]  # [{role, content}]
 
-# -------- slot extraction with LLM (JSON) --------
-def _extract_slots(messages: List[Dict[str,str]]) -> CoffeeSlots:
+# -------- ultra-light slot extraction (no LLM) --------
+def _extract_slots_simple(messages: List[Dict[str,str]]) -> CoffeeSlots:
     """
-    Ask the model to extract slots as JSON.
-    Falls back to empty slots on parse errors.
+    Heuristic extraction from the latest user messages (fast & deterministic).
+    Looks for beverage/machine/roast and numbers for dose(g), temp(C), pressure(bar), yield(g), time(s).
     """
-    sys = (
-        "Extract coffee parameters from the conversation. "
-        "Return ONLY compact JSON with keys: beverage, machine, roast, dose_g, yield_g, "
-        "water_temp_c, pressure_bar, grind_setting, extraction_time_s. "
-        "Values can be null if unknown. Do not include any text outside JSON."
+    text = " ".join([m["content"] for m in messages if m.get("role") == "user"]).lower()
+
+    def fnum(pat):
+        m = re.search(pat, text)
+        return float(m.group(1)) if m else None
+
+    beverage = None
+    for b in ["espresso","pourover","aeropress","french_press","moka","americano","cappuccino","latte"]:
+        if b in text: beverage = b; break
+
+    machine = None
+    if "lever" in text: machine = "espresso_lever"
+    elif "pump" in text or "breville" in text or "gaggia" in text: machine = "espresso_pump"
+    elif "pod" in text: machine = "pod"
+    elif "moka" in text: machine = "moka"
+    elif "aeropress" in text: machine = "aeropress"
+    elif "french press" in text: machine = "french_press"
+    elif "pourover" in text or "pour-over" in text or "v60" in text: machine = "pourover_kettle"
+
+    roast = "light" if "light roast" in text else "dark" if "dark roast" in text else ("medium" if "medium roast" in text else None)
+
+    dose_g = fnum(r"(?:dose|dosing|in)\s*(\d+(?:\.\d+)?)\s*g")
+    if dose_g is None:
+        dose_g = fnum(r"(\d+(?:\.\d+)?)\s*g(?:ram)?\b")
+    water_temp_c = fnum(r"(?:temp|temperature|brew)\s*(\d+(?:\.\d+)?)\s* ?c")
+    pressure_bar = fnum(r"(?:pressure|bar)\s*(\d+(?:\.\d+)?)\s*bar")
+    yield_g = fnum(r"(?:yield|out)\s*(\d+(?:\.\d+)?)\s*g")
+    extraction_time_s = fnum(r"(?:time|shot|extraction)\s*(\d+(?:\.\d+)?)\s*s")
+
+    return CoffeeSlots(
+        beverage=beverage, machine=machine, roast=roast,
+        dose_g=dose_g, yield_g=yield_g,
+        water_temp_c=water_temp_c, pressure_bar=pressure_bar,
+        extraction_time_s=extraction_time_s
     )
-    client = _client()
-    try:
-        resp = client.chat.completions.create(
-            model=MODEL, temperature=0,
-            messages=[{"role":"system","content":sys}, *messages]
-        )
-        raw = resp.choices[0].message.content.strip()
-        data = json.loads(raw) if raw.startswith("{") else {}
-        return CoffeeSlots(**data)
-    except Exception:
-        return CoffeeSlots()
 
 # =========================
-#     /coach/turn
+#     /coach/turn (advice only)
 # =========================
 @router.post("/turn")
 def coach_turn(req: CoachTurnRequest):
     messages = req.messages
-    slots = _extract_slots(messages)
-    missing = _needed_slots(slots)
 
-    # RAG
-    q = _slots_query(slots)
+    # 1) Extract slots (no LLM)
+    slots = _extract_slots_simple(messages)
+
+    # 2) Retrieve context (for citations) — small, fast
+    q = " ".join([x for x in [slots.beverage, slots.roast] if x]) or "coffee recipe basics"
     docs = retrieve(q, k=2)
-    sources = [os.path.basename(d.metadata.get("source","")) for d in docs]
-    ctx = _ctx(docs)
 
-    # Ask for missing info (LLM, strict)
-    if missing:
-        bev = slots.beverage or "unknown"
-        need_list = ", ".join(missing)
-        prompt = (
-            f"You are a coffee coach. Beverage: {bev}.\n"
-            f"Ask ONLY for these missing fields: {need_list}.\n"
-            "Do not ask about anything else. "
-            "If beverage is not 'espresso', NEVER ask about shots, pumps, levers, or pressure. "
-            "Write one short question (<= 25 words), no bullets, no preamble."
-            "\n\nContext from coffee books (optional):\n" + ctx
-        )
-        ans = _client().chat.completions.create(
-            model=MODEL, temperature=0.1,
-            messages=[{"role":"system","content":"Be brief and helpful."},
-                      *messages, {"role":"user","content":prompt}]
-        ).choices[0].message.content
-        return {"reply": ans, "need": missing, "sources": sources}
-
-    # We have enough — compute rule-based targets and return deterministic text
+    # 3) Compute rule targets
     rec = _recommend_from_slots(slots)
-    det_text = _format_recipe(rec, sources)
-    return {"reply": det_text, "need": [], "sources": sources, "targets": rec.targets}
+
+    # 4) Build advice-only text
+    tips = _advice(slots, rec, docs)
+    reply_text = _format_advice_only(tips)
+
+    # 5) Meta
+    sources = _dedupe_sources(docs)
+    return {"reply": reply_text, "sources": sources, "targets": rec.targets}
 
 # =========================
-#     /coach/stream
+#     /coach/stream (advice only)
 # =========================
 @router.post("/stream")
 def coach_stream(req: CoachTurnRequest = Body(...)):
     messages = req.messages
-    slots = _extract_slots(messages)
-    missing = _needed_slots(slots)
 
-    # RAG
-    q = _slots_query(slots)
+    # 1) Extract slots (no LLM)
+    slots = _extract_slots_simple(messages)
+
+    # 2) Retrieve context
+    q = " ".join([x for x in [slots.beverage, slots.roast] if x]) or "coffee recipe basics"
     docs = retrieve(q, k=2)
-    sources = [os.path.basename(d.metadata.get("source","")) for d in docs]
-    ctx = _ctx(docs)
 
-    # If missing → stream a strict, short question from the LLM
-    if missing:
-        bev = slots.beverage or "unknown"
-        need_list = ", ".join(missing)
-        prompt = (
-            f"You are a coffee coach. Beverage: {bev}.\n"
-            f"Ask ONLY for these missing fields: {need_list}.\n"
-            "Do not ask about anything else. "
-            "If beverage is not 'espresso', NEVER ask about shots, pumps, levers, or pressure. "
-            "Write one short question (<= 25 words), no bullets, no preamble."
-            "\n\nContext from coffee books (optional):\n" + ctx
-        )
-        def sse_q():
-            stream = _client().chat.completions.create(
-                model=MODEL, temperature=0.1, stream=True,
-                messages=[{"role":"system","content":"Be brief and helpful."},
-                          *messages, {"role":"user","content":prompt}]
-            )
-            for chunk in stream:
-                if not chunk.choices: 
-                    continue
-                delta = chunk.choices[0].delta
-                content = getattr(delta, "content", None)
-                if content:
-                    yield f"data: {content}\n\n"
-            yield f"event: meta\ndata: {json.dumps({'need': missing, 'sources': sources})}\n\n"
-            yield "data: [DONE]\n\n"
-        return StreamingResponse(
-            sse_q(),
-            media_type="text/event-stream",
-            headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no","Connection":"keep-alive"}
-        )
-
-    # Not missing → deterministic streaming of the recipe (fast, structured)
+    # 3) Compute rule targets
     rec = _recommend_from_slots(slots)
-    det_text = _format_recipe(rec, sources)
 
-    def sse_recipe():
-        for line in det_text.splitlines():
+    # 4) Advice-only text
+    tips = _advice(slots, rec, docs)
+    text = _format_advice_only(tips)
+    sources = _dedupe_sources(docs)
+
+    # 5) Stream only the advice lines + meta
+    def sse():
+        for line in text.splitlines():
             yield f"data: {line}\n\n"
-        yield f"event: meta\ndata: {json.dumps({'sources': sources, 'targets': rec.targets})}\n\n"
+        meta = {"sources": sources, "targets": rec.targets}
+        yield f"event: meta\ndata: {json.dumps(meta)}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(
-        sse_recipe(),
+        sse(),
         media_type="text/event-stream",
         headers={"Cache-Control":"no-cache","X-Accel-Buffering":"no","Connection":"keep-alive"}
     )
