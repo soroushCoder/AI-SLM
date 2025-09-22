@@ -1,8 +1,294 @@
-# rebuild API with new deps
-docker compose -f deploy/docker-compose.dev.yml build --no-cache api
+# SLM Chatbot + RAG + Coffee Coach
 
-# start/refresh everything
-docker compose -f deploy/docker-compose.dev.yml up -d
+An Azure-ready microservices project that lets you:
 
-# (if you didn't already) pull the SLM
-docker compose -f deploy/docker-compose.dev.yml exec ollama ollama pull phi3:mini
+- **Ingest** Markdown/PDF docs into a **vector index** (Milvus)
+- **Chat** with a **small LLM** (via Ollama) grounded by your docs (RAG)
+- **Stream** token-by-token responses (SSE)
+- **Ingest in the background** (Celery + Redis)
+- Provide a **Coffee Coach** that mixes **book knowledge (RAG)** with a **rules engine** for practical recipes and tips
+
+> Stack: FastAPI · Celery · Redis · Milvus · MinIO · etcd · Ollama · OpenTelemetry (hooks)  
+> Dev runtime: Docker Compose (Apple Silicon friendly)
+
+---
+
+## Contents
+
+- [Architecture](#architecture)
+- [Services](#services)
+- [Directory Layout](#directory-layout)
+- [Prerequisites](#prerequisites)
+- [Quick Start](#quick-start)
+- [Configuration](#configuration)
+- [Makefile cheatsheet](#makefile-cheatsheet)
+- [Seed data & ingest](#seed-data--ingest)
+- [APIs & testing](#apis--testing)
+  - [/chat (non-streaming)](#post-chat-non-streaming)
+  - [/chat/stream (streaming)](#post-chatstream-streaming)
+  - [/coffee/recommend (rules)](#post-coffeerecommend-rules)
+  - [/coach/turn (RAG + rules)](#post-coachturn-rag--rules)
+  - [/coach/stream (RAG + rules, streaming)](#post-coachstream-rag--rules-streaming)
+- [Troubleshooting](#troubleshooting)
+- [Notes & next steps](#notes--next-steps)
+
+---
+
+## Architecture
+
+**UI ↔ FastAPI (API Gateway)** → **Celery Orchestrator** (Redis broker) → **Workers**  
+RAG storage in **Milvus** (with MinIO + etcd). **Ollama** hosts the chat model (defaults to `phi3:mini`, but you can switch).
+
+**Ingest flow**:  
+`POST /ingest` → enqueue Celery task → Worker reads `/data`, chunks, embeds, **upserts** to Milvus → status via `/ingest/status/{task_id}`.
+
+**Chat flow**:  
+User message → retrieve top-k chunks from Milvus → prepend as “Company Context” → call LLM (Ollama) → stream tokens.
+
+**Coffee Coach**:  
+Extracts **slots** (beverage/machine/roast/dose/temp/pressure/…) from the conversation, retrieves relevant passages from your “coffee books”, applies a **rules engine**, and composes an actionable answer with **citations**.
+
+---
+
+## Services
+
+- **api**: FastAPI (chat, streaming, ingest endpoints, coffee coach)
+- **worker**: Celery worker (background ingestion)
+- **redis**: message broker + result backend
+- **milvus**: vector DB (standalone) + **minio** + **etcd**
+- **ollama**: local LLM runtime (http://localhost:11434)
+
+Compose file: `deploy/docker-compose.dev.yml`
+
+---
+
+## Directory Layout
+
+```
+repo/
+├─ api/
+│  ├─ app/
+│  │  ├─ main.py               # FastAPI app & routes
+│  │  ├─ ingest.py             # chunk + embed + upsert + Celery task
+│  │  ├─ vectorstore.py        # Milvus integration + embeddings
+│  │  ├─ coffee.py             # rules engine (espresso, pourover, etc.)
+│  │  ├─ coach.py              # conversational coach (RAG + rules)
+│  │  ├─ celery_app.py         # Celery config
+│  │  └─ web/                  # tiny HTML test pages (optional)
+│  ├─ requirements.txt
+│  └─ Dockerfile
+├─ data/
+│  └─ company_kb/              # your docs live here (mounted to /data)
+├─ deploy/
+│  └─ docker-compose.dev.yml
+├─ Makefile
+└─ README.md
+```
+
+---
+
+## Prerequisites
+
+- **Docker Desktop** (allocate ~6–8 CPUs, 12–16 GB RAM for best dev experience)
+- **Apple Silicon**: compose already sets `platform: linux/arm64` where needed
+- Optional: **OpenAI API key** (if you want hosted embeddings)
+
+---
+
+## Quick Start
+
+```bash
+# 1) Bring up the stack
+make up
+
+# 2) Pull a tiny LLM (one time)
+make pull-model   # defaults to phi3:mini (fast on laptops)
+
+# 3) Seed a couple of docs (for RAG)
+make seed-kb
+
+# 4) Ingest (background task) – returns a task_id
+make ingest-q KEY=devkey
+
+# 5) Watch the worker
+make logs-worker
+
+# 6) Try the Coffee Coach & rules endpoints
+make coffee-espresso KEY=devkey
+make coach-turn      KEY=devkey
+make coach-stream    KEY=devkey  # streamed tokens in terminal
+```
+
+> **API key**: by default, the API requires `X-API-Key: devkey`.  
+> Change or disable via `API_KEYS` in `docker-compose.dev.yml`.
+
+---
+
+## Configuration
+
+Edit `deploy/docker-compose.dev.yml`:
+
+- **LLM via Ollama**
+  - `OPENAI_BASE_URL: http://ollama:11434/v1`
+  - `LLM_MODEL: phi3:mini` (try `qwen2.5:1.5b-instruct` for even snappier replies)
+- **RAG**
+  - `MILVUS_COLLECTION` (use a new name if you change embed dims)
+  - Embeddings:
+    - `EMBEDDINGS_KIND: local` + `EMBEDDINGS_MODEL: sentence-transformers/all-MiniLM-L6-v2` (no external key)
+    - or `EMBEDDINGS_KIND: openai` + `OPENAI_EMBED_MODEL` + **`OPENAI_API_KEY`**
+- **Auth & rate limit**
+  - `API_KEYS: devkey` (comma-separated list). Set to `""` to disable in dev.
+  - `RATE_LIMIT_PER_MIN: 60` (set to `0` to disable)
+
+**Volumes**  
+Both **api** and **worker** mount `../data:/data` so the worker can read your documents.
+
+---
+
+## Makefile cheatsheet
+
+```bash
+# Lifecycle
+make up            # build + start everything
+make down          # stop
+make restart       # rebuild API only
+make ps            # status
+make logs-api      # tail API logs
+make logs-worker   # tail worker logs
+
+# Models & health
+make pull-model    # ollama pull phi3:mini
+make health        # GET /health
+
+# RAG
+make seed-kb       # create sample docs under ./data/company_kb
+make ingest-q KEY=devkey           # POST /ingest (returns task_id)
+make ingest-status ID=<task_id> KEY=devkey
+make debug Q="espresso temperature"  # shows retrieved chunks
+
+# Chat (non-coach)
+make chat Q="your question" KEY=devkey
+
+# Coffee endpoints
+make coffee-espresso KEY=devkey
+make coffee-pourover KEY=devkey
+
+# Coach (RAG + rules)
+make coach-turn   KEY=devkey
+make coach-follow KEY=devkey
+make coach-stream KEY=devkey  # SSE streaming
+```
+
+Set `BASE` to point elsewhere if not localhost:
+```bash
+make coach-turn BASE=http://myhost:8000 KEY=prodkey
+```
+
+---
+
+## Seed data & ingest
+
+```bash
+make seed-kb
+
+# queue ingestion (background Celery)
+make ingest-q KEY=devkey
+
+# poll until SUCCESS
+make ingest-status ID=<task_id> KEY=devkey
+```
+
+If you see `/data/company_kb not found`, ensure the folder exists on your **host** and both **api** and **worker** mount `../data:/data`.
+
+---
+
+## APIs & testing
+
+### `POST /chat` (non-streaming)
+
+```bash
+curl -s -X POST http://localhost:8000/chat   -H 'Content-Type: application/json' -H 'X-API-Key: devkey'   -d '{"messages":[{"role":"user","content":"What are our support hours?"}]}' | jq .
+```
+
+**Response**
+```json
+{ "content": "…", "sources": ["espresso_guide.md"] }
+```
+
+### `POST /chat/stream` (streaming)
+
+```bash
+curl -N -X POST http://localhost:8000/chat/stream   -H 'Content-Type: application/json' -H 'X-API-Key: devkey'   -d '{"messages":[{"role":"user","content":"Summarize support policy"}]}'
+```
+You’ll see `data: …` token events, then a final `event: meta` with `sources`.
+
+### `POST /coffee/recommend` (rules)
+
+```bash
+curl -s -X POST http://localhost:8000/coffee/recommend   -H 'Content-Type: application/json' -H 'X-API-Key: devkey'   -d '{ "beverage":"espresso", "machine":"espresso_pump", "roast":"medium", "dose_g":18, "water_temp_c":93, "pressure_bar":9 }' | jq .
+```
+
+### `POST /coach/turn` (RAG + rules)
+
+```bash
+curl -s -X POST http://localhost:8000/coach/turn   -H 'Content-Type: application/json' -H 'X-API-Key: devkey'   -d '{ "messages":[ {"role":"user","content":"I have a lever espresso machine and a light roast. Help me dial in."} ] }' | jq .
+```
+
+### `POST /coach/stream` (RAG + rules, streaming)
+
+```bash
+curl -N -X POST http://localhost:8000/coach/stream   -H 'Content-Type: application/json' -H 'X-API-Key: devkey'   -d '{ "messages":[
+        {"role":"user","content":"Pourover with medium roast, can you recommend settings?"},
+        {"role":"assistant","content":"What dose and water temperature will you use?"},
+        {"role":"user","content":"Dose 20g, temp 93C."}
+      ] }'
+```
+
+---
+
+## Troubleshooting
+
+- **401 Invalid or missing API key**  
+  Add `-H 'X-API-Key: devkey'` or set `API_KEYS: ""` for dev.
+
+- **429 Rate limit exceeded**  
+  Lower traffic or set `RATE_LIMIT_PER_MIN: 0` during dev.
+
+- **`/data/company_kb not found`**  
+  Create `./data/company_kb` on host and mount `../data:/data` on **api** and **worker**.
+
+- **`Received unregistered task … app.tasks.ingest_dir_task`**  
+  Ensure:
+  - `api/app/__init__.py` exists  
+  - `celery_app.py` includes `include=["app.ingest"]`  
+  Rebuild worker.
+
+- **Redis connection errors**  
+  Make sure the `redis` service is up; `REDIS_URL=redis://redis:6379/0`; from the api container:  
+  `nc -zv redis 6379`
+
+- **Very slow first ingest**  
+  Local embeddings will download a model once. To speed up: use `EMBEDDINGS_KIND=openai` + `OPENAI_API_KEY`, or cache HF models with a volume (`hf_cache`).
+
+- **No streaming output with curl**  
+  Use `curl -N` and ensure no proxy buffers SSE. We already set `Cache-Control: no-cache` headers.
+
+---
+
+## Notes & next steps
+
+- Swap to **`langchain-milvus`** and **`langchain-openai`** to remove deprecation warnings.
+- Add **Flower** to monitor Celery tasks:
+  ```yaml
+  flower:
+    image: mher/flower:1.2.0
+    command: ["celery","--broker=redis://redis:6379/0","flower","--port=5555"]
+    ports: ["5555:5555"]
+    depends_on: [redis]
+  ```
+- Persist **chat history** and feedback in Postgres (models + `/history` endpoints).
+- Add **GitHub Actions** to lint/test on PRs and deploy to Azure Container Apps.
+
+---
+
+Happy brewing ☕️ and shipping!
