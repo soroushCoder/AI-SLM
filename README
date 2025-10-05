@@ -292,3 +292,8 @@ curl -N -X POST http://localhost:8000/coach/stream   -H 'Content-Type: applicati
 ---
 
 Happy brewing ☕️ and shipping!
+
+
+## Architecture
+
+![Production-Ready AI API Flow](docs/architecture.png)
