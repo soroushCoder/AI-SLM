@@ -27,8 +27,8 @@ An Azure-ready microservices project that lets you:
   - [/chat (non-streaming)](#post-chat-non-streaming)
   - [/chat/stream (streaming)](#post-chatstream-streaming)
   - [/coffee/recommend (rules)](#post-coffeerecommend-rules)
-  - [/coach/turn (RAG + rules)](#post-coachturn-rag--rules)
-  - [/coach/stream (RAG + rules, streaming)](#post-coachstream-rag--rules-streaming)
+  - [/coach/turn (RAG + rules; advice-only)](#post-coachturn-rag--rules-advice-only)
+  - [/coach/stream (RAG + rules; advice-only streaming)](#post-coachstream-rag--rules-advice-only-streaming)
 - [Troubleshooting](#troubleshooting)
 - [Notes & next steps](#notes--next-steps)
 
@@ -39,14 +39,14 @@ An Azure-ready microservices project that lets you:
 **UI ↔ FastAPI (API Gateway)** → **Celery Orchestrator** (Redis broker) → **Workers**  
 RAG storage in **Milvus** (with MinIO + etcd). **Ollama** hosts the chat model (defaults to `phi3:mini`, but you can switch).
 
-**Ingest flow**:  
+**Ingest flow:**  
 `POST /ingest` → enqueue Celery task → Worker reads `/data`, chunks, embeds, **upserts** to Milvus → status via `/ingest/status/{task_id}`.
 
-**Chat flow**:  
+**Chat flow:**  
 User message → retrieve top-k chunks from Milvus → prepend as “Company Context” → call LLM (Ollama) → stream tokens.
 
-**Coffee Coach**:  
-Extracts **slots** (beverage/machine/roast/dose/temp/pressure/…) from the conversation, retrieves relevant passages from your “coffee books”, applies a **rules engine**, and composes an actionable answer with **citations**.
+**Coffee Coach:**  
+Extracts **slots** (beverage/machine/roast/dose/temp/pressure/…) from the conversation, retrieves relevant passages from your “coffee books,” applies a **rules engine**, and returns actionable **advice** with **citations**.
 
 ---
 
@@ -72,7 +72,7 @@ repo/
 │  │  ├─ ingest.py             # chunk + embed + upsert + Celery task
 │  │  ├─ vectorstore.py        # Milvus integration + embeddings
 │  │  ├─ coffee.py             # rules engine (espresso, pourover, etc.)
-│  │  ├─ coach.py              # conversational coach (RAG + rules)
+│  │  ├─ coach.py              # conversational coach (RAG + rules; advice-only)
 │  │  ├─ celery_app.py         # Celery config
 │  │  └─ web/                  # tiny HTML test pages (optional)
 │  ├─ requirements.txt
@@ -116,10 +116,10 @@ make logs-worker
 # 6) Try the Coffee Coach & rules endpoints
 make coffee-espresso KEY=devkey
 make coach-turn      KEY=devkey
-make coach-stream    KEY=devkey  # streamed tokens in terminal
+make coach-stream    KEY=devkey  # streamed advice in terminal
 ```
 
-> **API key**: by default, the API requires `X-API-Key: devkey`.  
+> **API key:** by default, the API requires `X-API-Key: devkey`.  
 > Change or disable via `API_KEYS` in `docker-compose.dev.yml`.
 
 ---
@@ -138,7 +138,7 @@ Edit `deploy/docker-compose.dev.yml`:
     - or `EMBEDDINGS_KIND: openai` + `OPENAI_EMBED_MODEL` + **`OPENAI_API_KEY`**
 - **Auth & rate limit**
   - `API_KEYS: devkey` (comma-separated list). Set to `""` to disable in dev.
-  - `RATE_LIMIT_PER_MIN: 60` (set to `0` to disable)
+  - `RATE_LIMIT_PER_MIN: 60` (set to `0`` to disable)
 
 **Volumes**  
 Both **api** and **worker** mount `../data:/data` so the worker can read your documents.
@@ -173,7 +173,7 @@ make chat Q="your question" KEY=devkey
 make coffee-espresso KEY=devkey
 make coffee-pourover KEY=devkey
 
-# Coach (RAG + rules)
+# Coach (RAG + rules; advice-only)
 make coach-turn   KEY=devkey
 make coach-follow KEY=devkey
 make coach-stream KEY=devkey  # SSE streaming
@@ -190,12 +190,8 @@ make coach-turn BASE=http://myhost:8000 KEY=prodkey
 
 ```bash
 make seed-kb
-
-# queue ingestion (background Celery)
 make ingest-q KEY=devkey
-
-# poll until SUCCESS
-make ingest-status ID=<task_id> KEY=devkey
+make ingest-status ID=<task_id> KEY=devkey   # poll until SUCCESS
 ```
 
 If you see `/data/company_kb not found`, ensure the folder exists on your **host** and both **api** and **worker** mount `../data:/data`.
@@ -205,73 +201,42 @@ If you see `/data/company_kb not found`, ensure the folder exists on your **host
 ## APIs & testing
 
 ### `POST /chat` (non-streaming)
-
 ```bash
 curl -s -X POST http://localhost:8000/chat   -H 'Content-Type: application/json' -H 'X-API-Key: devkey'   -d '{"messages":[{"role":"user","content":"What are our support hours?"}]}' | jq .
 ```
 
-**Response**
-```json
-{ "content": "…", "sources": ["espresso_guide.md"] }
-```
-
 ### `POST /chat/stream` (streaming)
-
 ```bash
 curl -N -X POST http://localhost:8000/chat/stream   -H 'Content-Type: application/json' -H 'X-API-Key: devkey'   -d '{"messages":[{"role":"user","content":"Summarize support policy"}]}'
 ```
-You’ll see `data: …` token events, then a final `event: meta` with `sources`.
 
 ### `POST /coffee/recommend` (rules)
-
 ```bash
-curl -s -X POST http://localhost:8000/coffee/recommend   -H 'Content-Type: application/json' -H 'X-API-Key: devkey'   -d '{ "beverage":"espresso", "machine":"espresso_pump", "roast":"medium", "dose_g":18, "water_temp_c":93, "pressure_bar":9 }' | jq .
+curl -s -X POST http://localhost:8000/coffee/recommend   -H 'Content-Type: application/json' -H 'X-API-Key: devkey'   -d '{ "beverage":"espresso", "machine":"espresso_pump", "roast":"medium",
+        "dose_g":18, "water_temp_c":93, "pressure_bar":9 }' | jq .
 ```
 
-### `POST /coach/turn` (RAG + rules)
-
+### `POST /coach/turn` (RAG + rules; advice-only)
 ```bash
-curl -s -X POST http://localhost:8000/coach/turn   -H 'Content-Type: application/json' -H 'X-API-Key: devkey'   -d '{ "messages":[ {"role":"user","content":"I have a lever espresso machine and a light roast. Help me dial in."} ] }' | jq .
+curl -s -X POST http://localhost:8000/coach/turn   -H 'Content-Type: application/json' -H 'X-API-Key: devkey'   -d '{ "messages":[{"role":"user","content":"I have a lever espresso machine and a light roast. Help me dial in."}] }' | jq .
 ```
 
-### `POST /coach/stream` (RAG + rules, streaming)
-
+### `POST /coach/stream` (RAG + rules; advice-only streaming)
 ```bash
-curl -N -X POST http://localhost:8000/coach/stream   -H 'Content-Type: application/json' -H 'X-API-Key: devkey'   -d '{ "messages":[
-        {"role":"user","content":"Pourover with medium roast, can you recommend settings?"},
-        {"role":"assistant","content":"What dose and water temperature will you use?"},
-        {"role":"user","content":"Dose 20g, temp 93C."}
-      ] }'
+curl -N -X POST http://localhost:8000/coach/stream   -H 'Content-Type: application/json' -H 'X-API-Key: devkey'   -d '{ "messages":[{"role":"user","content":"Pourover with medium roast, dose 20g, temp 93C."}] }'
 ```
 
 ---
 
 ## Troubleshooting
 
-- **401 Invalid or missing API key**  
-  Add `-H 'X-API-Key: devkey'` or set `API_KEYS: ""` for dev.
-
-- **429 Rate limit exceeded**  
-  Lower traffic or set `RATE_LIMIT_PER_MIN: 0` during dev.
-
-- **`/data/company_kb not found`**  
-  Create `./data/company_kb` on host and mount `../data:/data` on **api** and **worker**.
-
-- **`Received unregistered task … app.tasks.ingest_dir_task`**  
-  Ensure:
-  - `api/app/__init__.py` exists  
-  - `celery_app.py` includes `include=["app.ingest"]`  
-  Rebuild worker.
-
-- **Redis connection errors**  
-  Make sure the `redis` service is up; `REDIS_URL=redis://redis:6379/0`; from the api container:  
-  `nc -zv redis 6379`
-
-- **Very slow first ingest**  
-  Local embeddings will download a model once. To speed up: use `EMBEDDINGS_KIND=openai` + `OPENAI_API_KEY`, or cache HF models with a volume (`hf_cache`).
-
-- **No streaming output with curl**  
-  Use `curl -N` and ensure no proxy buffers SSE. We already set `Cache-Control: no-cache` headers.
+- **401 Invalid or missing API key** — add `-H 'X-API-Key: devkey'` or set `API_KEYS: ""` in compose for dev.  
+- **429 Rate limit exceeded** — lower traffic or set `RATE_LIMIT_PER_MIN: 0` during dev.  
+- **`/data/company_kb not found`** — create `./data/company_kb` and mount `../data:/data` on **api** and **worker**.  
+- **`Received unregistered task … app.tasks.ingest_dir_task`** — ensure `api/app/__init__.py` exists and `celery_app.py` includes `include=["app.ingest"]`; rebuild worker.  
+- **Redis connection errors** — verify `redis` is up; `REDIS_URL=redis://redis:6379/0`; from api container: `nc -zv redis 6379`.  
+- **Very slow first ingest** — local embeddings download once; to speed up, set `EMBEDDINGS_KIND=openai` & `OPENAI_API_KEY` or mount a HF cache volume.  
+- **No streaming output with curl** — use `curl -N`; proxies can buffer SSE.  
 
 ---
 
@@ -291,13 +256,6 @@ curl -N -X POST http://localhost:8000/coach/stream   -H 'Content-Type: applicati
 
 ---
 
-Happy brewing ☕️ and shipping!
-
-
 ## Architecture
 
-## Architecture
-
-<p align="center">
-  <img src="docs/architecture.png" alt="Production-Ready AI API Flow" width="860">
-</p>
+![Production-Ready AI API Flow](docs/architecture.png)
